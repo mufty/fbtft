@@ -17,11 +17,15 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/gpio.h>
 #include <linux/spi/spi.h>
+#include <linux/mfd/stmpe.h>
+
+#include <mach/irqs.h>
 
 #include "fbtft.h"
 
@@ -29,7 +33,37 @@
 
 #define MAX_GPIOS 32
 
-struct spi_device *spi_device;
+#define BCM2708_PERI_BASE       0x20000000
+#define GPIO_BASE               (BCM2708_PERI_BASE + 0x200000)
+
+#define GPIO_REG(g) (gpio_reg + ((g / 10) * 4))
+#define GPIO_GPPUD (0x94)
+#define GPIO_GPCLK0 (0x98)
+#define GPIO_GPCLK(x) (GPIO_GPCLK0 + 4 * ((x) >> 5))
+#define SET_GPIO_ALT(g,a) \
+	__raw_writel(							    \
+		(((a) <= 3 ? (a) + 4:(a) == 4 ? 3 : 2)<<(((g) % 10) * 3))   \
+		| (__raw_readl(GPIO_REG(g)) & ( ~(7 << (((g) % 10) * 3)))), \
+		GPIO_REG(g))
+
+#define GPIO_PULL_SET(pin, val) \
+	do { \
+		__raw_writel((val) & 3, gpio_reg + GPIO_GPPUD); \
+		msleep(5); \
+		__raw_writel(1 << ((pin) & 31), gpio_reg + GPIO_GPCLK(pin)); \
+		msleep(5); \
+		__raw_writel(0, gpio_reg + GPIO_GPPUD); \
+		msleep(5); \
+		__raw_writel(0, gpio_reg + GPIO_GPCLK(pin)); \
+		msleep(5); \
+	} while(0);
+#define GPIO_PULL_COMMIT(x)
+static void __iomem *gpio_reg;
+
+
+#define MAX_DEVS 8
+static struct spi_device *spi_devices[MAX_DEVS];
+static int spi_device_count;
 struct platform_device *p_device;
 
 static char *name;
@@ -118,11 +152,37 @@ module_param(verbose, uint, 0);
 MODULE_PARM_DESC(verbose,
 "0 silent, >0 show gpios, >1 show devices, >2 show devices before (default=3)");
 
+static unsigned long frequency = 16000000;
+module_param(frequency, ulong, 0644);
+MODULE_PARM_DESC(frequency,
+"Frequency of the TFT SPI interface");
+
+
+enum gpio_pull {
+	pull_none = 0,
+	pull_down = 1,
+	pull_up = 2,
+};
+
+struct gpio_setting {
+	uint32_t gpio;
+	enum gpio_pull pull;
+};
 
 struct fbtft_device_display {
 	char *name;
 	struct spi_board_info *spi;
 	struct platform_device *pdev;
+
+	/*
+	 * set to "1" to indicate support device * (e.g. touchscreen
+	 * controller) that doesn't have a standard LCD platform data struct.
+	 */
+	int is_support;
+
+	/* GPIO Pullups/pulldown */
+	struct gpio_setting *gpio_settings;
+	uint32_t gpio_num_settings;
 };
 
 static void fbtft_device_pdev_release(struct device *dev);
@@ -251,6 +311,61 @@ static struct fbtft_device_display displays[] = {
 				.gpios = (const struct fbtft_gpio []) {
 					{ "reset", 25 },
 					{ "dc", 24 },
+					{},
+				},
+			}
+		}
+	}, {
+		/* Touch device spi-half of adafruit touchscreen */
+		.name = "adafruitts",
+		.spi = &(struct spi_board_info) {
+			.modalias = "stmpe610",
+			.max_speed_hz = 500000,
+			.mode = SPI_MODE_0,
+			.chip_select = 1,
+			.platform_data = &(struct stmpe_platform_data) {
+				.blocks = STMPE_BLOCK_TOUCHSCREEN | STMPE_BLOCK_GPIO,
+				.irq_over_gpio = 1,
+				.irq_gpio = 24,
+				.irq_trigger = IRQF_TRIGGER_FALLING,
+				.irq_base = GPIO_IRQ_START + GPIO_IRQS,
+				.ts = &(struct stmpe_ts_platform_data) {
+					.sample_time = 4,
+					.mod_12b = 1,
+					.ref_sel = 0,
+					.adc_freq = 2,
+					.ave_ctrl = 3,
+					.touch_det_delay = 4,
+					.settling = 2,
+					.fraction_z = 7,
+					.i_drive = 0,
+				},
+			}
+		},
+		.is_support = 1,
+		.gpio_settings = (struct gpio_setting []) {
+			{
+				.gpio = 24,
+				.pull = pull_up,
+			}
+		},
+		.gpio_num_settings = 1,
+	}, {
+		/* LCD component of adafruit touchscreen */
+		.name = "adafruitts",
+		.spi = &(struct spi_board_info) {
+			.modalias = "fb_ili9340",
+			.max_speed_hz = 16000000,
+			.mode = SPI_MODE_0,
+			.chip_select = 0,
+			.platform_data = &(struct fbtft_platform_data) {
+				.display = {
+					.buswidth = 8,
+					.backlight = 1,
+				},
+				.bgr = true,
+				.gpios = (const struct fbtft_gpio []) {
+					{ "dc", 25 },
 					{},
 				},
 			}
@@ -860,7 +975,7 @@ static void fbtft_device_spi_delete(struct spi_master *master, unsigned cs)
 
 	dev = bus_find_device_by_name(&spi_bus_type, NULL, str);
 	if (dev) {
-		pr_err(DRVNAME": Deleting %s\n", str);
+		pr_err(DRVNAME": Deleting %s (%s)\n", str, dev_name(dev));
 		device_del(dev);
 	}
 }
@@ -996,59 +1111,87 @@ static int __init fbtft_device_init(void)
 		}
 	}
 
+	gpio_reg = ioremap(GPIO_BASE, 1024);
+
 	for (i = 0; i < ARRAY_SIZE(displays); i++) {
 		if (strncmp(name, displays[i].name, 32) == 0) {
+			int j;
 			if (displays[i].spi) {
+				int dev_cs;
 				spi = displays[i].spi;
-				spi->chip_select = cs;
+				dev_cs = spi->chip_select;
+				if (cs)
+					dev_cs = cs;
+				/* make sure bus:cs is available */
+				fbtft_device_delete(master, dev_cs);
+				spi->chip_select = dev_cs;
 				spi->bus_num = busnum;
 				if (speed)
 					spi->max_speed_hz = speed;
 				if (mode != -1)
 					spi->mode = mode;
-				pdata = (void *)spi->platform_data;
+				if (!displays[i].is_support) {
+					pdata = (void *)spi->platform_data;
+					spi->max_speed_hz = frequency;
+				}
 			} else if (displays[i].pdev) {
 				p_device = displays[i].pdev;
-				pdata = p_device->dev.platform_data;
+				if (!displays[i].is_support)
+					pdata = p_device->dev.platform_data;
 			} else {
 				pr_err(DRVNAME": broken displays array\n");
 				return -EINVAL;
 			}
 
-			pdata->rotate = rotate;
-			if (bgr == 0)
-				pdata->bgr = false;
-			else if (bgr == 1)
-				pdata->bgr = true;
-			if (startbyte)
-				pdata->startbyte = startbyte;
-			if (gamma)
-				pdata->gamma = gamma;
-			pdata->display.debug = debug;
-			if (fps)
-				pdata->fps = fps;
-			if (txbuflen)
-				pdata->txbuflen = txbuflen;
-			if (init_num)
-				pdata->display.init_sequence = init;
-			if (gpio)
-				pdata->gpios = gpio;
-			if (custom) {
-				pdata->display.width = width;
-				pdata->display.height = height;
-				pdata->display.buswidth = buswidth;
-				pdata->display.backlight = 1;
+			for (j = 0;
+			     j < displays[i].gpio_num_settings;
+			     j++) {
+				pr_err(DRVNAME": Looking at item %d\n", j);
+				pr_err(DRVNAME": Setting pin %d to %d\n",
+					displays[i].gpio_settings[j].gpio,
+					displays[i].gpio_settings[j].pull);
+				GPIO_PULL_SET(displays[i].gpio_settings[j].gpio,
+					displays[i].gpio_settings[j].pull);
+			}
+
+			/* Don't set this data for support drivers */
+			if (!displays[i].is_support) {
+				pdata->rotate = rotate;
+				if (bgr == 0)
+					pdata->bgr = false;
+				else if (bgr == 1)
+					pdata->bgr = true;
+				if (startbyte)
+					pdata->startbyte = startbyte;
+				if (gamma)
+					pdata->gamma = gamma;
+				pdata->display.debug = debug;
+				if (fps)
+					pdata->fps = fps;
+				if (txbuflen)
+					pdata->txbuflen = txbuflen;
+				if (init_num)
+					pdata->display.init_sequence = init;
+				if (gpio)
+					pdata->gpios = gpio;
+				if (custom) {
+					pdata->display.width = width;
+					pdata->display.height = height;
+					pdata->display.buswidth = buswidth;
+				}
 			}
 
 			if (displays[i].spi) {
+				struct spi_device *spi_device;
 				ret = fbtft_device_spi_device_register(spi);
 				if (ret) {
 					pr_err(DRVNAME \
 						": failed to register SPI device\n");
 					return ret;
 				}
-				found = true;
-				break;
+				spi_devices[spi_device_count++] = spi_device;
+				if (!displays[i].is_support)
+					found = true;
 			} else {
 				ret = platform_device_register(p_device);
 				if (ret < 0) {
@@ -1057,8 +1200,8 @@ static int __init fbtft_device_init(void)
 						ret);
 					return ret;
 				}
-				found = true;
-				break;
+				if (!displays[i].is_support)
+					found = true;
 			}
 		}
 	}
@@ -1082,7 +1225,7 @@ static int __init fbtft_device_init(void)
 			pr_info(DRVNAME":    (none)\n");
 	}
 
-	if (spi_device && (verbose > 1))
+	if (spi_device_count && (verbose > 1))
 		pr_spi_devices();
 	if (p_device && (verbose > 1))
 		pr_p_devices();
@@ -1094,14 +1237,19 @@ static void __exit fbtft_device_exit(void)
 {
 	pr_debug(DRVNAME" - exit\n");
 
-	if (spi_device) {
-		device_del(&spi_device->dev);
-		kfree(spi_device);
+	if (spi_device_count) {
+		int i;
+		for (i = 0; i < spi_device_count; i++) {
+			device_del(&spi_devices[i]->dev);
+			kfree(spi_devices[i]);
+		}
 	}
 
 	if (p_device)
 		platform_device_unregister(p_device);
 
+	if (gpio_reg)
+		iounmap(gpio_reg);
 }
 
 arch_initcall(fbtft_device_init);
