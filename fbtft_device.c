@@ -279,11 +279,39 @@ static struct fbtft_device_display displays[] = {
 			}
 		}
 	}, {
-		.name = "adafruit22a",
+		.name = "adafruitts",
+		.spi = &(struct spi_board_info) {
+			.modalias = "stmpe610",
+			.max_speed_hz = 500000,
+			.mode = SPI_MODE_0,
+			.chip_select = 1,
+			.platform_data = &(struct stmpe_platform_data) {
+				.blocks = STMPE_BLOCK_TOUCHSCREEN | STMPE_BLOCK_GPIO,
+				.irq_over_gpio = 1,
+				.irq_gpio = 24,
+				.irq_trigger = IRQF_TRIGGER_FALLING,
+				.irq_base = GPIO_IRQ_START + GPIO_IRQS,
+				.ts = &(struct stmpe_ts_platform_data) {
+					.sample_time = 4,
+					.mod_12b = 1,
+					.ref_sel = 0,
+					.adc_freq = 2,
+					.ave_ctrl = 3,
+					.touch_det_delay = 4,
+					.settling = 2,
+					.fraction_z = 7,
+					.i_drive = 0,
+				},
+			}
+		}
+	},  {
+		/* LCD component of adafruit touchscreen */
+		.name = "adafruitts",
 		.spi = &(struct spi_board_info) {
 			.modalias = "fb_ili9340",
-			.max_speed_hz = 32000000,
+			.max_speed_hz = 15000000,
 			.mode = SPI_MODE_0,
+			.chip_select = 0,
 			.platform_data = &(struct fbtft_platform_data) {
 				.display = {
 					.buswidth = 8,
@@ -291,9 +319,7 @@ static struct fbtft_device_display displays[] = {
 				},
 				.bgr = true,
 				.gpios = (const struct fbtft_gpio []) {
-					{ "reset", 25 },
-					{ "dc", 24 },
-					{ "led", 18 },
+					{ "dc", 25 },
 					{},
 				},
 			}
